@@ -1,0 +1,104 @@
+name: Decompile and Investigate APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'Direct download URL of the base APK (not XAPK)'
+        required: true
+      note:
+        description: 'Optional note for this run'
+        required: false
+        default: ''
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install apktool
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wget unzip
+          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -O apktool.jar
+          echo '#!/bin/sh' > apktool
+          echo 'java -jar "$(dirname "$0")/apktool.jar" "$@"' >> apktool
+          chmod +x apktool apktool.jar
+          ./apktool --version
+
+      - name: Download APK
+        run: |
+          mkdir -p work
+          curl -L --fail --retry 3 -o work/base.apk "${{ github.event.inputs.apk_url }}"
+          ls -lh work/base.apk
+          file work/base.apk || true
+
+      - name: Decompile with apktool
+        run: |
+          ./apktool d -f work/base.apk -o work/decompiled
+          echo "=== Structure ==="
+          find work/decompiled -maxdepth 2 -type d | head -40
+          echo "=== PairIP classes ==="
+          find work/decompiled -path '*pairip*' -name '*.smali' | head -50
+
+      - name: Dump critical PairIP sources
+        run: |
+          mkdir -p out/pairip
+          for f in \
+            work/decompiled/smali/com/pairip/application/Application.smali \
+            work/decompiled/smali/com/pairip/StartupLauncher.smali \
+            work/decompiled/smali/com/pairip/VMRunner.smali \
+            work/decompiled/smali/com/pairip/SignatureCheck.smali \
+            work/decompiled/smali/com/pairip/licensecheck/LicenseClient.smali \
+            work/decompiled/smali/com/pairip/licensecheck/LicenseContentProvider.smali \
+            work/decompiled/smali/com/pairip/licensecheck/LicenseActivity.smali
+          do
+            if [ -f "$f" ]; then
+              cp "$f" out/pairip/
+              echo "OK $f"
+            else
+              # try smali_classes*
+              found=$(find work/decompiled -name "$(basename $f)" 2>/dev/null | head -1)
+              if [ -n "$found" ]; then
+                cp "$found" out/pairip/
+                echo "OK $found"
+              else
+                echo "MISSING $f"
+              fi
+            fi
+          done
+          echo "=== Application.smali ==="
+          cat out/pairip/Application.smali 2>/dev/null || true
+          echo "=== VMRunner loadLibrary / executeVM ==="
+          grep -n "loadLibrary\|executeVM\|native " out/pairip/VMRunner.smali 2>/dev/null | head -30 || true
+          echo "=== LicenseContentProvider onCreate ==="
+          grep -A20 "onCreate" out/pairip/LicenseContentProvider.smali 2>/dev/null || true
+
+      - name: Extract native lib strings if present
+        run: |
+          mkdir -p out/native
+          find work/decompiled -name 'libpairipcore.so' 2>/dev/null | head -5
+          # base apk may not have abi splits
+          echo "Base APK native search done"
+
+      - name: Manifest pairip entries
+        run: |
+          grep -i pairip work/decompiled/AndroidManifest.xml > out/manifest_pairip.txt || true
+          cat out/manifest_pairip.txt
+
+      - name: Upload decompiled artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pairip-investigation
+          path: |
+            out/
+            work/decompiled/AndroidManifest.xml
+            work/decompiled/apktool.yml
+          retention-days: 14
